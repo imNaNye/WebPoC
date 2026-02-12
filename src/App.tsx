@@ -1,10 +1,16 @@
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { fetchMarkers } from '@/api/fetchMarkers'
 import { fetchTumorAreas } from '@/api/fetchTumorAreas'
+import { fetchSlides } from '@/api/fetchSlides'
+import { fetchSlideInfo } from '@/api/fetchSlideInfo'
 import { ImageMarkerViewer } from '@/components/ImageMarkerViewer'
+import { WSIViewer } from '@/components/WSIViewer'
 import { useViewerStore } from '@/stores/viewerStore'
 
 function App() {
+  const [selectedSlideId, setSelectedSlideId] = useState<string | null>(null)
+
   const {
     data: markers = [],
     isLoading: isLoadingMarkers,
@@ -28,6 +34,19 @@ function App() {
     queryFn: fetchTumorAreas,
     refetchOnWindowFocus: false,
     enabled: false,
+  })
+
+  const { data: slides = [], isLoading: isLoadingSlides } = useQuery({
+    queryKey: ['slides'],
+    queryFn: fetchSlides,
+    refetchOnWindowFocus: false,
+    retry: false,
+  })
+
+  const { data: slideInfo } = useQuery({
+    queryKey: ['slideInfo', selectedSlideId],
+    queryFn: () => fetchSlideInfo(selectedSlideId!),
+    enabled: !!selectedSlideId,
   })
 
   const isFetching = isFetchingMarkers || isFetchingTumorAreas
@@ -68,6 +87,21 @@ function App() {
   return (
     <div style={{ padding: 16, maxWidth: 900, margin: '0 auto' }}>
       <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <span style={{ fontWeight: 600, marginRight: 4 }}>WSI:</span>
+        <select
+          value={selectedSlideId ?? ''}
+          onChange={(e) => setSelectedSlideId(e.target.value || null)}
+          style={{ padding: '4px 8px', minWidth: 120 }}
+          title="타일 서버에서 불러온 슬라이드 목록"
+        >
+          <option value="">단일 이미지 모드</option>
+          {isLoadingSlides && <option disabled>슬라이드 목록 로딩…</option>}
+          {slides.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </select>
         <button
           type="button"
           onClick={refetchAll}
@@ -109,7 +143,16 @@ function App() {
         </p>
       )}
 
-      <ImageMarkerViewer markers={markers} tumorAreas={tumorAreas} />
+      {selectedSlideId && slideInfo ? (
+        <WSIViewer
+          slideId={selectedSlideId}
+          slideInfo={slideInfo}
+          markers={markers}
+          tumorAreas={tumorAreas}
+        />
+      ) : (
+        <ImageMarkerViewer markers={markers} tumorAreas={tumorAreas} />
+      )}
     </div>
   )
 }
