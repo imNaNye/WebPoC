@@ -1,15 +1,27 @@
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueries } from '@tanstack/react-query'
 import { fetchMarkers } from '@/api/fetchMarkers'
 import { fetchTumorAreas } from '@/api/fetchTumorAreas'
 import { fetchSlides } from '@/api/fetchSlides'
 import { fetchSlideInfo } from '@/api/fetchSlideInfo'
+import type { SlideInfo } from '@/api/fetchSlideInfo'
 import { ImageMarkerViewer } from '@/components/ImageMarkerViewer'
 import { WSIViewer } from '@/components/WSIViewer'
+import { QuadView } from '@/components/QuadView'
 import { useViewerStore } from '@/stores/viewerStore'
 
 function App() {
+  const [viewMode, setViewMode] = useState<'single' | 'quad'>('single')
   const [selectedSlideId, setSelectedSlideId] = useState<string | null>(null)
+  const [panelSlots, setPanelSlotsState] = useState<(string | null)[]>(() => [null, null, null, null])
+
+  const setPanelSlot = (index: number, slideId: string | null) => {
+    setPanelSlotsState((prev) => {
+      const next = [...prev]
+      next[index] = slideId
+      return next
+    })
+  }
 
   const {
     data: markers = [],
@@ -49,6 +61,15 @@ function App() {
     enabled: !!selectedSlideId,
   })
 
+  const panelSlideInfos = useQueries({
+    queries: [0, 1, 2, 3].map((i) => ({
+      queryKey: ['slideInfo', panelSlots[i]] as const,
+      queryFn: () => fetchSlideInfo(panelSlots[i]!),
+      enabled: !!panelSlots[i],
+    })),
+  })
+  const slideInfos: (SlideInfo | undefined)[] = panelSlideInfos.map((q) => q.data)
+
   const isFetching = isFetchingMarkers || isFetchingTumorAreas
   const refetchAll = () => {
     refetchMarkers()
@@ -87,6 +108,15 @@ function App() {
   return (
     <div style={{ padding: 16, maxWidth: 900, margin: '0 auto' }}>
       <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <span style={{ fontWeight: 600, marginRight: 4 }}>뷰 모드:</span>
+        <select
+          value={viewMode}
+          onChange={(e) => setViewMode(e.target.value as 'single' | 'quad')}
+          style={{ padding: '4px 8px', minWidth: 120 }}
+        >
+          <option value="single">단일 뷰 모드</option>
+          <option value="quad">쿼드뷰 모드</option>
+        </select>
         <span style={{ fontWeight: 600, marginRight: 4 }}>WSI:</span>
         <select
           value={selectedSlideId ?? ''}
@@ -143,7 +173,16 @@ function App() {
         </p>
       )}
 
-      {selectedSlideId && slideInfo ? (
+      {viewMode === 'quad' ? (
+        <QuadView
+          panelSlots={panelSlots}
+          setPanelSlot={setPanelSlot}
+          slides={slides}
+          slideInfos={slideInfos}
+          markers={markers}
+          tumorAreas={tumorAreas}
+        />
+      ) : selectedSlideId && slideInfo ? (
         <WSIViewer
           slideId={selectedSlideId}
           slideInfo={slideInfo}

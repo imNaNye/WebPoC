@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from 'react'
 import DeckGL from '@deck.gl/react'
 import { OrthographicView } from '@deck.gl/core'
 import { ScatterplotLayer, SolidPolygonLayer } from '@deck.gl/layers'
@@ -19,11 +19,28 @@ const orthoView = new OrthographicView({
   flipY: true,
 })
 
+export interface WSIViewerRef {
+  getViewport(): {
+    panBy: (delta: { x: number; y: number }) => void
+    getCenter: (current?: boolean) => { x: number; y: number }
+    getZoom: (current?: boolean) => number
+    zoomTo: (zoom: number, center?: { x: number; y: number }) => void
+    panTo: (center: { x: number; y: number }) => void
+  } | null
+}
+
 interface WSIViewerProps {
   slideId: string
   slideInfo: SlideInfo
   markers: MarkerItem[]
   tumorAreas?: TumorArea[]
+  showScale?: boolean
+  onFocus?: () => void
+  onPan?: () => void
+  onZoom?: () => void
+  onTileLoaded?: (fileId: string) => void
+  width?: number
+  height?: number
 }
 
 function closePolygon(polygon: [number, number][]): [number, number][] {
@@ -34,7 +51,10 @@ function closePolygon(polygon: [number, number][]): [number, number][] {
   return [...polygon, first]
 }
 
-export function WSIViewer({ slideId, slideInfo, markers, tumorAreas = [] }: WSIViewerProps) {
+export const WSIViewer = forwardRef<WSIViewerRef, WSIViewerProps>(function WSIViewer(
+  { slideId, slideInfo, markers, tumorAreas = [], showScale = true, onFocus, onPan, onZoom, onTileLoaded, width = VIEWER_WIDTH, height = VIEWER_HEIGHT },
+  ref
+) {
   const osdContainerRef = useRef<HTMLDivElement>(null)
   const viewerRef = useRef<{
     viewport: {
@@ -108,6 +128,15 @@ export function WSIViewer({ slideId, slideInfo, markers, tumorAreas = [] }: WSIV
     }))
   }, [])
 
+  const onFocusRef = useRef(onFocus)
+  const onPanRef = useRef(onPan)
+  const onZoomRef = useRef(onZoom)
+  const onTileLoadedRef = useRef(onTileLoaded)
+  onFocusRef.current = onFocus
+  onPanRef.current = onPan
+  onZoomRef.current = onZoom
+  onTileLoadedRef.current = onTileLoaded
+
   useEffect(() => {
     const container = osdContainerRef.current
     if (!container || !slideId || !slideInfo) return
@@ -145,6 +174,8 @@ export function WSIViewer({ slideId, slideInfo, markers, tumorAreas = [] }: WSIV
 
     viewer.addHandler('canvas-scroll', (e: { preventDefaultAction: boolean; scroll: number }) => {
       e.preventDefaultAction = true
+      onFocusRef.current?.()
+      onZoomRef.current?.()
       const factor = Math.pow((viewer as unknown as { zoomPerScroll: number }).zoomPerScroll, e.scroll)
       const center = viewer.viewport.getCenter(true)
       viewer.viewport.zoomBy(factor, center)
@@ -156,8 +187,19 @@ export function WSIViewer({ slideId, slideInfo, markers, tumorAreas = [] }: WSIV
       syncViewport()
     })
     viewer.addHandler('animation', syncViewport)
-    viewer.addHandler('zoom', syncViewport)
-    viewer.addHandler('pan', syncViewport)
+    viewer.addHandler('zoom', () => {
+      syncViewport()
+      onFocusRef.current?.()
+      onZoomRef.current?.()
+    })
+    viewer.addHandler('pan', () => {
+      syncViewport()
+      onFocusRef.current?.()
+      onPanRef.current?.()
+    })
+    viewer.addHandler('tile-loaded', () => {
+      onTileLoadedRef.current?.(slideId)
+    })
 
     viewerRef.current = viewer
     return () => {
@@ -166,6 +208,25 @@ export function WSIViewer({ slideId, slideInfo, markers, tumorAreas = [] }: WSIV
       setOsdReady(false)
     }
   }, [slideId, slideInfo, syncViewport])
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      getViewport() {
+        const v = viewerRef.current
+        if (!v?.viewport) return null
+        const vp = v.viewport
+        return {
+          panBy: (delta: { x: number; y: number }) => vp.panBy(delta),
+          getCenter: (current?: boolean) => vp.getCenter(current),
+          getZoom: (current?: boolean) => vp.getZoom(current),
+          zoomTo: (zoom: number, center?: { x: number; y: number }) => vp.zoomTo(zoom, center ?? vp.getCenter(true)),
+          panTo: (center: { x: number; y: number }) => vp.panTo(center),
+        }
+      },
+    }),
+    []
+  )
 
   const layers: Layer[] = []
   if (overlayVisible && osdReady) {
@@ -232,45 +293,47 @@ export function WSIViewer({ slideId, slideInfo, markers, tumorAreas = [] }: WSIV
     <div
       style={{
         position: 'relative',
-        width: VIEWER_WIDTH,
-        height: VIEWER_HEIGHT,
+        width,
+        height,
         maxWidth: '100%',
         overflow: 'hidden',
       }}
     >
-      <div
-        style={{
-          position: 'absolute',
-          top: 0,
-          left: 0,
-          right: 0,
-          padding: '6px 10px',
-          background: 'rgba(0, 0, 0, 0.65)',
-          color: '#eee',
-          fontSize: 12,
-          fontFamily: 'ui-monospace, monospace',
-          zIndex: 10,
-          display: 'flex',
-          gap: '16px',
-        }}
-      >
-        <span>배율: {imageZoom.toFixed(2)}×</span>
-        <span>중심: ({centerX}, {centerY})</span>
-      </div>
+      {showScale && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            padding: '6px 10px',
+            background: 'rgba(0, 0, 0, 0.65)',
+            color: '#eee',
+            fontSize: 12,
+            fontFamily: 'ui-monospace, monospace',
+            zIndex: 10,
+            display: 'flex',
+            gap: '16px',
+          }}
+        >
+          <span>배율: {imageZoom.toFixed(2)}×</span>
+          <span>중심: ({centerX}, {centerY})</span>
+        </div>
+      )}
       <div
         ref={osdContainerRef}
         style={{
           position: 'absolute',
           left: 0,
           top: 0,
-          width: VIEWER_WIDTH,
-          height: VIEWER_HEIGHT,
+          width,
+          height,
         }}
       />
       {osdReady && (
         <DeckGL
-          width={VIEWER_WIDTH}
-          height={VIEWER_HEIGHT}
+          width={width}
+          height={height}
           views={[orthoView]}
           viewState={viewState}
           onViewStateChange={({ viewState: vs }) => setViewState(vs as typeof viewState)}
@@ -281,4 +344,4 @@ export function WSIViewer({ slideId, slideInfo, markers, tumorAreas = [] }: WSIV
       )}
     </div>
   )
-}
+})

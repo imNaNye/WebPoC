@@ -8,9 +8,13 @@ WSI 파일을 OpenSlide로 열고, 요청된 타일을 생성하는 서비스.
   level 0 = 최고 해상도(원본), level 1 = 1/2, level 2 = 1/4 ... 로 피라미드가 있다.
 - 타일: 클라이언트(OpenSeaDragon)가 요청하는 작은 조각(예: 256x256).
   read_region(level, (x,y), width, height)로 해당 영역 픽셀만 읽어 JPEG로 인코딩해 반환한다.
+
+슬라이드당 OpenSlide 인스턴스 풀: 요청마다 열고 닫지 않고, 슬라이드(경로)당 최대 n개 인스턴스를
+유지해 두고 요청 시 풀에서 꺼내 사용 후 반환한다.
 """
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +39,66 @@ import io
 SUPPORTED_EXTENSIONS = {".ndpi", ".svs", ".tif", ".tiff", ".vms", ".vmu", ".scn", ".bif", ".mrxs"}
 
 TILE_SIZE = 256
+
+# 슬라이드당 OpenSlide 인스턴스 풀 최대 개수 (동시 타일 요청 등에 대비)
+MAX_OPENSLIDE_INSTANCES_PER_SLIDE = 4
+
+
+class OpenSlidePool:
+    """
+    슬라이드(파일 경로)당 OpenSlide 인스턴스 풀.
+    acquire(path)로 인스턴스를 얻고, 사용 후 release(path, instance)로 반환한다.
+    """
+
+    def __init__(self, max_per_slide: int = MAX_OPENSLIDE_INSTANCES_PER_SLIDE):
+        self._max_per_slide = max_per_slide
+        self._pool: dict[str, list] = {}  # path_str -> [OpenSlide, ...]
+        self._in_use: dict[str, int] = {}  # path_str -> count
+        self._lock = threading.Lock()
+
+    def acquire(self, slide_path: Path):
+        if openslide is None:
+            raise RuntimeError("openslide-python is not installed or OpenSlide library is missing")
+        path_str = str(slide_path.resolve())
+        with self._lock:
+            if path_str not in self._pool:
+                self._pool[path_str] = []
+                self._in_use[path_str] = 0
+            available = self._pool[path_str]
+            total = len(available) + self._in_use[path_str]
+            if available:
+                slide = available.pop()
+                self._in_use[path_str] += 1
+                return slide
+            if total >= self._max_per_slide:
+                # 풀 한도 초과 시 None 반환 → 호출측에서 임시로 열었다 닫기
+                return None
+            self._in_use[path_str] += 1
+        try:
+            slide = openslide.OpenSlide(path_str)
+        except Exception as e:
+            with self._lock:
+                self._in_use[path_str] -= 1
+            raise RuntimeError(f"OpenSlide could not open {slide_path}: {e}") from e
+        return slide
+
+    def release(self, slide_path: Path, slide) -> None:
+        path_str = str(slide_path.resolve())
+        with self._lock:
+            self._in_use[path_str] -= 1
+            self._pool[path_str].append(slide)
+
+
+_slide_pool: Optional[OpenSlidePool] = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool() -> OpenSlidePool:
+    global _slide_pool
+    with _pool_lock:
+        if _slide_pool is None:
+            _slide_pool = OpenSlidePool()
+        return _slide_pool
 
 
 def get_wsi_dir() -> Path:
@@ -77,18 +141,39 @@ def find_slide_path(wsi_dir: Path, slide_id: str) -> Optional[Path]:
     return None
 
 
+def _with_slide(slide_path: Path, use_slide):
+    """
+    풀에서 OpenSlide 인스턴스를 얻어 use_slide(slide)를 실행한다.
+    풀에 여유가 없으면 해당 요청만 임시로 열었다 닫는다.
+    """
+    pool = _get_pool()
+    slide = pool.acquire(slide_path)
+    if slide is not None:
+        try:
+            return use_slide(slide)
+        finally:
+            pool.release(slide_path, slide)
+    path_str = str(slide_path.resolve())
+    try:
+        slide = openslide.OpenSlide(path_str)
+    except Exception as e:
+        raise RuntimeError(f"OpenSlide could not open {slide_path}: {e}") from e
+    try:
+        return use_slide(slide)
+    finally:
+        slide.close()
+
+
 def get_slide_info(slide_path: Path) -> dict:
     """
     OpenSlide로 슬라이드를 열어 level 0 기준 크기, 레벨 수, 타일 크기를 반환.
     level_dimensions[i] = (width, height) at level i. level 0이 원본 해상도.
+    풀에서 인스턴스를 꺼내 사용 후 반환한다.
     """
     if openslide is None:
         raise RuntimeError("openslide-python is not installed or OpenSlide library is missing")
-    try:
-        slide = openslide.OpenSlide(str(slide_path))
-    except Exception as e:
-        raise RuntimeError(f"OpenSlide could not open {slide_path}: {e}") from e
-    try:
+
+    def use(slide):
         if slide.level_count < 1:
             raise RuntimeError(f"Slide has no levels: {slide_path}")
         w, h = slide.level_dimensions[0]
@@ -103,8 +188,8 @@ def get_slide_info(slide_path: Path) -> dict:
             "levelDimensions": level_dimensions,
             "levelDownsamples": level_downsamples,
         }
-    finally:
-        slide.close()
+
+    return _with_slide(slide_path, use)
 
 
 def get_tile_bytes(slide_path: Path, level: int, x: int, y: int, ext: str = "jpg") -> bytes:
@@ -112,17 +197,16 @@ def get_tile_bytes(slide_path: Path, level: int, x: int, y: int, ext: str = "jpg
     지정 level에서 (x, y) 타일 인덱스에 해당하는 영역을 읽어 이미지 바이트로 반환.
     OpenSlide read_region(location, level, size)의 location은 항상 level 0 픽셀 좌표이므로,
     해당 레벨의 타일 (x,y) 위치를 level 0 좌표로 변환해야 한다.
+    풀에서 인스턴스를 꺼내 사용 후 반환한다.
     """
     if openslide is None:
         raise RuntimeError("openslide-python is not installed or OpenSlide library is missing")
-    slide = openslide.OpenSlide(str(slide_path))
-    try:
+
+    def use(slide):
         w0, h0 = slide.level_dimensions[0]
         wL, hL = slide.level_dimensions[level]
-        # 해당 레벨에서 타일 (x,y)의 픽셀 좌표 (해당 레벨 기준)
         px_at_L = x * TILE_SIZE
         py_at_L = y * TILE_SIZE
-        # level 0 좌표로 변환 (read_region은 location을 level 0으로 기대함)
         scale_x = w0 / wL
         scale_y = h0 / hL
         px = int(px_at_L * scale_x)
@@ -133,14 +217,12 @@ def get_tile_bytes(slide_path: Path, level: int, x: int, y: int, ext: str = "jpg
             img = Image.new("RGB", (TILE_SIZE, TILE_SIZE), (255, 255, 255))
         else:
             region = slide.read_region((px, py), level, (read_w, read_h))
-            # read_region은 RGBA. JPEG는 RGB만 지원하므로 변환. 배경 흰색으로 합성.
             if region.mode == "RGBA":
                 img = Image.new("RGB", region.size, (255, 255, 255))
                 img.paste(region, mask=region.split()[3])
             else:
                 img = region.convert("RGB")
             if read_w < TILE_SIZE or read_h < TILE_SIZE:
-                # 패딩하여 항상 TILE_SIZE x TILE_SIZE 반환
                 out = Image.new("RGB", (TILE_SIZE, TILE_SIZE), (255, 255, 255))
                 out.paste(img, (0, 0))
                 img = out
@@ -150,5 +232,5 @@ def get_tile_bytes(slide_path: Path, level: int, x: int, y: int, ext: str = "jpg
         else:
             img.save(buf, format="JPEG", quality=85)
         return buf.getvalue()
-    finally:
-        slide.close()
+
+    return _with_slide(slide_path, use)
