@@ -94,12 +94,14 @@ def get_slide_info(slide_path: Path) -> dict:
         w, h = slide.level_dimensions[0]
         level_count = slide.level_count
         level_dimensions = [list(slide.level_dimensions[i]) for i in range(level_count)]
+        level_downsamples = list(slide.level_downsamples)
         return {
             "width": w,
             "height": h,
             "levelCount": level_count,
             "tileSize": TILE_SIZE,
             "levelDimensions": level_dimensions,
+            "levelDownsamples": level_downsamples,
         }
     finally:
         slide.close()

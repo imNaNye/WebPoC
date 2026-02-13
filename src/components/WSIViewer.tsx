@@ -114,21 +114,32 @@ export function WSIViewer({ slideId, slideInfo, markers, tumorAreas = [] }: WSIV
 
     const levelCount = slideInfo.levelCount
     const maxLevel = levelCount - 1
+    const levelDims = slideInfo.levelDimensions
     const getTileUrl = (level: number, x: number, y: number) => {
       const serverLevel = maxLevel - level
       return `${TILE_SERVER_BASE_URL}/api/slides/${encodeURIComponent(slideId)}/tiles/${serverLevel}/${x}_${y}.jpg`
     }
 
+    const tileSource: Record<string, unknown> = {
+      width: slideInfo.width,
+      height: slideInfo.height,
+      tileSize: slideInfo.tileSize,
+      minLevel: 0,
+      maxLevel,
+      getTileUrl,
+    }
+
+    if (levelDims && levelDims.length === levelCount) {
+      tileSource.getLevelScale = (level: number) => {
+        if (level < 0 || level > maxLevel) return 1 / Math.pow(2, maxLevel - level)
+        const serverLevel = maxLevel - level
+        return levelDims[serverLevel][0] / slideInfo.width
+      }
+    }
+
     const viewer = OpenSeadragon({
       element: container,
-      tileSources: {
-        width: slideInfo.width,
-        height: slideInfo.height,
-        tileSize: slideInfo.tileSize,
-        minLevel: 0,
-        maxLevel,
-        getTileUrl,
-      },
+      tileSources: tileSource,
       showNavigator: false,
     })
 
